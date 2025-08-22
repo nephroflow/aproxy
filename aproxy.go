@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -18,12 +19,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"golang.org/x/crypto/cryptobyte"
 )
 
-var version = "0.2.2"
+var version = "0.2.4"
 
 // PrereadConn is a wrapper around net.Conn that supports pre-reading from the underlying connection.
 // Any Read before the EndPreread can be undone and read again by calling the EndPreread function.
@@ -84,27 +84,24 @@ func PrereadSNI(conn *PrereadConn) (_ string, err error) {
 			err = fmt.Errorf("failed to preread TLS client hello: %w", err)
 		}
 	}()
-	typeVersionLen := make([]byte, 5)
-	n, err := conn.Read(typeVersionLen)
-	if n != 5 {
-		return "", errors.New("too short")
-	}
+	recordHeader := make([]byte, 5)
+	n, err := io.ReadFull(conn, recordHeader)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read TLS record layer header: %w", err)
 	}
-	if typeVersionLen[0] != 22 {
+	if n != 5 {
+		return "", fmt.Errorf("failed to read TLS record layer header: too short, less than 5 bytes (%d)", n)
+	}
+	if recordHeader[0] != 22 {
 		return "", errors.New("not a TCP handshake")
 	}
-	msgLen := binary.BigEndian.Uint16(typeVersionLen[3:])
+	msgLen := binary.BigEndian.Uint16(recordHeader[3:])
 	buf := make([]byte, msgLen+5)
-	n, err = conn.Read(buf[5:])
+	n, err = io.ReadFull(conn, buf[5:])
 	if n != int(msgLen) {
-		return "", errors.New("too short")
+		return "", fmt.Errorf("client hello too short (%d < %d), err: %w", n, msgLen, err)
 	}
-	if err != nil {
-		return "", err
-	}
-	copy(buf[:5], typeVersionLen)
+	copy(buf[:5], recordHeader)
 	return extractSNI(buf)
 }
 
@@ -224,6 +221,7 @@ func DialProxy(proxy string) (net.Conn, error) {
 }
 
 // DialProxyConnect dials the TCP connection and finishes the HTTP CONNECT handshake with the proxy.
+// dst: HOST:PORT or IP:PORT
 func DialProxyConnect(proxy string, dst string) (net.Conn, error) {
 	conn, err := DialProxy(proxy)
 	if err != nil {
@@ -247,11 +245,11 @@ func DialProxyConnect(proxy string, dst string) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to send connect request to http proxy: %w", err)
 	}
 	response, err := http.ReadResponse(bufio.NewReaderSize(conn, 0), &request)
-	if response.StatusCode != 200 {
-		return nil, fmt.Errorf("proxy return %d response for connect request", response.StatusCode)
-	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to receive http connect response from proxy: %w", err)
+	}
+	if response.StatusCode != 200 {
+		return nil, fmt.Errorf("proxy return %d response for connect request", response.StatusCode)
 	}
 	return conn, nil
 }
@@ -268,11 +266,7 @@ func GetOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert connection to file: %w", err)
 	}
-	return GetsockoptIPv4OriginalDst(
-		int(file.Fd()),
-		syscall.SOL_IP,
-		80, // SO_ORIGINAL_DST
-	)
+	return GetsockoptIPv4OriginalDst(file.Fd())
 }
 
 // RelayTCP relays data between the incoming TCP connection and the proxy connection.
@@ -304,10 +298,34 @@ func RelayHTTP(conn io.ReadWriter, proxyConn io.ReadWriteCloser, logger *slog.Lo
 	}
 	req.URL.Host = req.Host
 	req.URL.Scheme = "http"
+	if req.UserAgent() == "" {
+		req.Header.Set("User-Agent", "")
+	}
 	req.Header.Set("Connection", "close")
-	if err := req.WriteProxy(proxyConn); err != nil {
-		logger.Error("failed to send HTTP request to proxy", "error", err)
-		return
+	if req.Proto == "HTTP/1.0" {
+		// no matter what the request protocol is, Go enforces a minimum version of HTTP/1.1
+		// this causes problems for HTTP/1.0 only clients like GPG (HKP)
+		// manually modify and send the HTTP/1.0 request to the proxy server
+		buf := bytes.NewBuffer(nil)
+		err := req.WriteProxy(buf)
+		if err != nil {
+			logger.Error("failed to serialize HTTP/1.0 request", "error", err)
+			return
+		}
+		reqStr := buf.String()
+		crlfIndex := strings.Index(reqStr, "\r\n")
+		protoSpaceIndex := strings.LastIndex(reqStr[:crlfIndex], " ")
+		reqStr = reqStr[:protoSpaceIndex+1] + "HTTP/1.0" + reqStr[crlfIndex:]
+		_, err = proxyConn.Write([]byte(reqStr))
+		if err != nil {
+			logger.Error("failed to send HTTP request to proxy", "error", err)
+			return
+		}
+	} else {
+		if err := req.WriteProxy(proxyConn); err != nil {
+			logger.Error("failed to send HTTP request to proxy", "error", err)
+			return
+		}
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(proxyConn), req)
 	if err != nil {
@@ -349,7 +367,7 @@ func HandleConn(conn net.Conn, proxy string) {
 			logger.Info("relay TLS connection to proxy")
 			RelayTCP(consigned, proxyConn, logger)
 		}
-	case 80:
+	case 80, 11371:
 		host, err := PrereadHttpHost(consigned)
 		if err != nil {
 			logger.Error("failed to preread HTTP host from connection", "error", err)
@@ -367,13 +385,19 @@ func HandleConn(conn net.Conn, proxy string) {
 		logger.Info("relay HTTP connection to proxy")
 		RelayHTTP(consigned, proxyConn, logger)
 	default:
-		logger.Error(fmt.Sprintf("unknown destination port: %d", dst.Port))
-		return
+		logger = logger.With("host", fmt.Sprintf("%s:%d", dst.IP.String(), dst.Port))
+		proxyConn, err := DialProxyConnect(proxy, fmt.Sprintf("%s:%d", dst.IP.String(), dst.Port))
+		if err != nil {
+			logger.Error("failed to connect to tcp proxy", "error", err)
+			return
+		}
+		logger.Info("relay TCP connection to proxy")
+		RelayTCP(consigned, proxyConn, logger)
 	}
 }
 
 func main() {
-	proxyFlag := flag.String("proxy", "", "upstream HTTP proxy address in the 'host:port' format")
+	proxyFlag := flag.String("proxy", "", "upstream proxy address in the 'host:port' format")
 	listenFlag := flag.String("listen", ":8443", "the address and port on which the server will listen")
 	flag.Parse()
 	listenAddr := *listenFlag
@@ -387,7 +411,7 @@ func main() {
 	slog.Info(fmt.Sprintf("start listening on %s", listenAddr))
 	proxy := *proxyFlag
 	if proxy == "" {
-		log.Fatalf("no upstearm proxy specified")
+		log.Fatalf("no upstream proxy specified")
 	}
 	slog.Info(fmt.Sprintf("start forwarding to proxy %s", proxy))
 	go func() {
